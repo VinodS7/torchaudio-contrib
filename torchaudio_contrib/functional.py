@@ -3,7 +3,50 @@ import math
 import torch.nn.functional as F
 
 
-def stft(signal, fft_len, hop_len, window,
+def _mel_to_hertz(mel, htk):
+    """
+    Converting mel values into frequency
+    """
+    mel = torch.as_tensor(mel).type(torch.get_default_dtype())
+
+    if htk:
+        return 700. * (10 ** (mel / 2595.) - 1.)
+
+    f_min = 0.0
+    f_sp = 200.0 / 3
+    hz = f_min + f_sp * mel
+
+    min_log_hz = 1000.0
+    min_log_mel = (min_log_hz - f_min) / f_sp
+    logstep = math.log(6.4) / 27.0
+
+    return torch.where(mel >= min_log_mel, min_log_hz *
+                       torch.exp(logstep * (mel - min_log_mel)), hz)
+
+
+def _hertz_to_mel(hz, htk):
+    """
+    Converting frequency into mel values
+    """
+    hz = torch.as_tensor(hz).type(torch.get_default_dtype())
+
+    if htk:
+        return 2595. * torch.log10(torch.tensor(1., dtype=torch.get_default_dtype()) + (hz / 700.))
+
+    f_min = 0.0
+    f_sp = 200.0 / 3
+
+    mel = (hz - f_min) / f_sp
+
+    min_log_hz = 1000.0
+    min_log_mel = (min_log_hz - f_min) / f_sp
+    logstep = math.log(6.4) / 27.0
+
+    return torch.where(hz >= min_log_hz, min_log_mel +
+                       torch.log(hz / min_log_hz) / logstep, mel)
+
+
+def stft(waveforms, fft_len, hop_len, window,
          pad=0, pad_mode="reflect", **kwargs):
     """
     Wrap torch.stft allowing for multi-channel stft.
@@ -33,98 +76,111 @@ def stft(signal, fft_len, hop_len, window,
 
     # (!) Only 3D, 4D, 5D padding with non-constant
     # padding are supported for now.
+
+    if waveforms.dim() == 2:
+        # This is added because otherwise F.pad does not work.
+        # Due to this manual padding, we use stft(center=False) below.
+        add_batch_dim = True
+        waveforms = waveforms.reshape((1,) + waveforms.shape)
+    else:
+        add_batch_dim = False
+
     if pad > 0:
-        signal = F.pad(signal, (pad, pad), pad_mode)
+        waveforms = F.pad(waveforms, (pad, pad), pad_mode)
 
-    leading_dims = signal.shape[:-1]
+    leading_dims = waveforms.shape[:-1]
 
-    signal = signal.reshape(-1, signal.size(-1))
+    waveforms = waveforms.reshape(-1, waveforms.size(-1))
 
-    spect = torch.stft(signal, fft_len, hop_len, window=window,
-                       win_length=window.size(0), **kwargs)
-    spect = spect.reshape(leading_dims + spect.shape[1:])
+    complex_specgrams = torch.stft(waveforms, fft_len, hop_len, window=window,
+                       win_length=window.size(0), center=False,
+                       **kwargs)
+    complex_specgrams = complex_specgrams.reshape(leading_dims + complex_specgrams.shape[1:])
 
-    return spect
+    if add_batch_dim:
+        complex_specgrams = complex_specgrams.reshape(complex_specgrams.shape[1:])
+
+    return complex_specgrams
 
 
-def complex_norm(tensor, power=1.0):
+def complex_norm(complex_tensor, power=1.0):
     """
     Normalize complex input.
+
+    Args:
+        complex_tensor (Tensor): Tensor shape of (*, complex=2)
     """
     if power == 1.:
-        return torch.norm(tensor, 2, -1)
-    return torch.norm(tensor, 2, -1).pow(power)
+        return torch.norm(complex_tensor, 2, -1)
+    return torch.norm(complex_tensor, 2, -1).pow(power)
 
 
-def create_mel_filter(num_bands, sample_rate, min_freq,
-                      max_freq, num_bins, to_hertz, from_hertz):
+def create_mel_filter(num_freqs, num_mels, min_freq, max_freq, htk):
     """
     Creates filter matrix to transform fft frequency bins
     into mel frequency bins.
     Equivalent to librosa.filters.mel(sample_rate, fft_len, htk=True, norm=None).
 
     Args:
-        num_bands (int): number of mel bins.
-        sample_rate (int): sample rate of audio signal.
+        num_freqs (int): number of filter banks from stft.
+        num_mels (int): number of mel bins.
         min_freq (float): minimum frequency.
         max_freq (float): maximum frequency.
-        num_bins (int): number of filter banks from stft.
-        to_hertz (function): convert from mel freq to hertz
-        from_hertz (function): convert from hertz to mel freq
+        htk (bool): whether following htk-mel scale or not
 
     Returns:
-        filterbank (Tensor): (num_bins, num_bands)
+        mel_filterbank (Tensor): (num_freqs, num_mels)
     """
     # Convert to find mel lower/upper bounds
-    m_min = from_hertz(min_freq)
-    m_max = from_hertz(max_freq)
+    m_min = _hertz_to_mel(min_freq, htk)
+    m_max = _hertz_to_mel(max_freq, htk)
 
     # Compute stft frequency values
-    stft_freqs = torch.linspace(min_freq, max_freq, num_bins)
+    stft_freqs = torch.linspace(min_freq, max_freq, num_freqs)
 
     # Find mel values, and convert them to frequency units
-    m_pts = torch.linspace(m_min, m_max, num_bands + 2)
-    f_pts = to_hertz(m_pts)
-    f_diff = f_pts[1:] - f_pts[:-1]  # (num_bands + 1)
+    m_pts = torch.linspace(m_min, m_max, num_mels + 2)
+    f_pts = _mel_to_hertz(m_pts, htk)
+    f_diff = f_pts[1:] - f_pts[:-1]  # (num_mels + 1)
 
-    # (num_bins, num_bands + 2)
+    # (num_freqs, num_mels + 2)
     slopes = f_pts.unsqueeze(0) - stft_freqs.unsqueeze(1)
 
-    down_slopes = (-1. * slopes[:, :-2]) / f_diff[:-1]  # (num_bins, num_bands)
-    up_slopes = slopes[:, 2:] / f_diff[1:]  # (num_bins, num_bands)
-    filterbank = torch.clamp(torch.min(down_slopes, up_slopes), min=0.)
+    down_slopes = (-1. * slopes[:, :-2]) / f_diff[:-1]  # (num_freqs, num_mels)
+    up_slopes = slopes[:, 2:] / f_diff[1:]  # (num_freqs, num_mels)
+    mel_filterbank = torch.clamp(torch.min(down_slopes, up_slopes), min=0.)
 
-    return filterbank
+    return mel_filterbank
 
 
-def apply_filterbank(spect, filterbank):
+def apply_filterbank(mag_specgrams, filterbank):
     """
     Transform spectrogram given a filterbank matrix.
 
     Args:
-        spect (Tensor): (batch, channel, num_bins, time)
-        filterbank (Tensor): (num_bins, num_bands)
+        mag_specgrams (Tensor): (batch, channel, num_freqs, time)
+        filterbank (Tensor): (num_freqs, num_bands)
 
     Returns:
         (Tensor): (batch, channel, num_bands, time)
     """
-    return torch.matmul(spect.transpose(-2, -1), filterbank).transpose(-2, -1)
+    return torch.matmul(mag_specgrams.transpose(-2, -1), filterbank).transpose(-2, -1)
 
 
-def angle(tensor):
+def angle(complex_tensor):
     """
     Return angle of a complex tensor with shape (*, 2).
     """
-    return torch.atan2(tensor[..., 1], tensor[..., 0])
+    return torch.atan2(complex_tensor[..., 1], complex_tensor[..., 0])
 
 
-def magphase(spect, power=1.):
+def magphase(complex_tensor, power=1.):
     """
     Separate a complex-valued spectrogram with shape (*,2)
     into its magnitude and phase.
     """
-    mag = complex_norm(spect, power)
-    phase = angle(spect)
+    mag = complex_norm(complex_tensor, power)
+    phase = angle(complex_tensor)
     return mag, phase
 
 
@@ -134,7 +190,7 @@ def phase_vocoder(spect, rate, phi_advance):
     without modifying pitch by a factor of `rate`.
 
     Args:
-        spect (Tensor): (batch, channel, num_bins, time, 2)
+        spect (Tensor): (batch, channel, num_bins, time, complex=2)
         rate (float): Speed-up factor
         phi_advance (Tensor): Expected phase advance in each bin. (num_bins, 1)
 
@@ -164,9 +220,9 @@ def phase_vocoder(spect, rate, phi_advance):
     spect_1_norm = torch.norm(spect_1, dim=-1)  # (new_bins, num_bins)
 
     spect_phase = spect_1_angle - spect_0_angle - \
-        phi_advance  # (new_bins, num_bins)
+                  phi_advance  # (new_bins, num_bins)
     spect_phase = spect_phase - 2 * math.pi * \
-        torch.round(spect_phase / (2 * math.pi))  # (new_bins, num_bins)
+                  torch.round(spect_phase / (2 * math.pi))  # (new_bins, num_bins)
 
     # Compute Phase Accum
     phase = spect_phase + phi_advance  # (new_bins, num_bins)
@@ -176,7 +232,7 @@ def phase_vocoder(spect, rate, phi_advance):
     phase_acc = torch.cumsum(phase, -1)  # (new_bins, num_bins)
 
     mag = alphas * spect_1_norm + (1 - alphas) * \
-        spect_0_norm  # (time//rate+1, num_bins)
+          spect_0_norm  # (time//rate+1, num_bins)
 
     spect_stretch_real = mag * torch.cos(phase_acc)  # (new_bins, num_bins)
     spect_stretch_imag = mag * torch.sin(phase_acc)  # (new_bins, num_bins)
@@ -202,7 +258,10 @@ def amplitude_to_db(x, ref=1.0, amin=1e-7):
         (Tensor): same size of x, after conversion
     """
     x = torch.clamp(x, min=amin)
-    return 10.0 * (torch.log10(x) - torch.log10(torch.tensor(ref, device=x.device, requires_grad=False)))
+    return 10.0 * (torch.log10(x) - torch.log10(torch.tensor(ref,
+                                                             device=x.device,
+                                                             requires_grad=False,
+                                                             dtype=x.dtype)))
 
 
 def db_to_amplitude(x, ref=1.0):
@@ -216,7 +275,10 @@ def db_to_amplitude(x, ref=1.0):
     Returns:
         (Tensor): same size of x, after conversion
     """
-    return torch.pow(10.0, x / 10.0 + torch.log10(torch.tensor(ref, device=x.device, requires_grad=False)))
+    return torch.pow(10.0, x / 10.0 + torch.log10(torch.tensor(ref,
+                                                               device=x.device,
+                                                               requires_grad=False,
+                                                               dtype=x.dtype)))
 
 
 def mu_law_encoding(x, n_quantize=256):
@@ -240,18 +302,19 @@ def mu_law_encoding(x, n_quantize=256):
     return x_mu
 
 
-def mu_law_decoding(x_mu, n_quantize=256):
+def mu_law_decoding(x_mu, n_quantize=256, dtype=torch.get_default_dtype()):
     """Apply mu-law decoding (expansion) to the input tensor.
 
     Args:
         x_mu (Tensor): mu-law encoded input
         n_quantize (int): quantization level. For 8-bit decoding, set 256 (2 ** 8).
+        dtype: specifies `dtype` for the decoded value. Default: `torch.get_default_dtype()`
 
     Returns:
         (Tensor): mu-law decoded tensor
     """
     if not x_mu.dtype.is_floating_point:
-        x_mu = x_mu.to(torch.float)
+        x_mu = x_mu.to(dtype)
     mu = torch.tensor(n_quantize - 1, dtype=x_mu.dtype, requires_grad=False)  # confused about dtype here..
     x = (x_mu / mu) * 2 - 1.
     x = x.sign() * (torch.exp(x.abs() * torch.log1p(mu)) - 1.) / mu
